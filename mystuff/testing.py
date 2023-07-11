@@ -1,8 +1,11 @@
 import os
 import pickle
+import sys
 
+from MetaD2A.MetaD2A_nas_bench_201 import set_encoder
 import torch
 
+sys.modules['set_encoder'] = set_encoder
 encodings_dir = 'data'
 generator_checkpoint_dir = 'results/generator/model'
 predictor_checkpoint_dir = 'results/predictor/model'
@@ -12,11 +15,11 @@ dim_input = 512
 
 
 def main():
-    data = {}
-    for file in os.listdir(predictor_checkpoint_dir):
-        if file.endswith('.pt'):
-            with open(predictor_checkpoint_dir + '/' + file, 'rb') as f:
-                data = torch.load(f)
+    # data = {}
+    # for file in os.listdir(predictor_checkpoint_dir):
+    #     if file.endswith('.pt'):
+    #         with open(predictor_checkpoint_dir + '/' + file, 'rb') as f:
+    #             data = torch.load(f)
 
     with open('../../mystuff/intra_setpool.pkl', 'rb') as input:
         intra_setpool = pickle.load(input)
