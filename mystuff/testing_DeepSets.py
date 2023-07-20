@@ -283,9 +283,9 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
     X, val_X, y, val_y, mfs, _ = train_test_split(data, labels, metafeatures, test_size=0.0123456789)
 
     # Initial Training Pool
-    pool_X, X = data[:pool_size], data[pool_size:]
-    pool_y, y = labels[:pool_size], labels[pool_size:]
-    pool_mfs, mfs = metafeatures[:pool_size], metafeatures[pool_size:]
+    pool_X, X = X[:pool_size], X[pool_size:]
+    pool_y, y = y[:pool_size], y[pool_size:]
+    pool_mfs, mfs = mfs[:pool_size], mfs[pool_size:]
 
     # Simple primary model
     primary_in = Input(shape=set_encoder.input_shape[-1])
@@ -350,7 +350,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
                         used = np.array([data_generator.used])
                         histogram = np.mean([np.histogram(predictions[:, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[1])], axis=0)
                         surrogate_in = np.concatenate((batch_metafeatures, pool_metafeatures, entropy, margin, confidence, used, histogram))
-
+                        surrogate_label, _ = primary_model.evaluate(val_X, val_y)
                         if best_weights is not None and restore_best_weights:
                             primary_model.set_weights(best_weights)
                             io_utils.print_msg(
@@ -372,7 +372,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
                             initial_loss = val_loss
                         else:
                             surrogate_X.append(surrogate_in)
-                            surrogate_y.append(initial_loss - val_loss)
+                            surrogate_y.append(initial_loss - surrogate_label)
                             initial_loss = val_loss
                         writer.add_scalar('val_loss', val_loss, batch)
                         writer.add_scalar('val_acc', accuracy, batch)
