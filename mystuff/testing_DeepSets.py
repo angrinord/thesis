@@ -16,6 +16,7 @@ from keras.utils import io_utils, Sequence
 from scipy import stats
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -25,7 +26,8 @@ set_enc_range = (2, 64)
 super_batch_count = 150
 primary_epochs = 10
 set_encoder_file = "deepset1.pkl"
-surrogate_data_file = "surrogate_data1.pkl"
+surrogate_data_file = "surrogate_data2.pkl"
+sigma = 1e-10
 
 
 def get_deepset_model(data_dim, images=None):  # NOTE: Passing images is only necessary for testing.
@@ -132,9 +134,10 @@ def train_random(batches, X_test, y_test):
 
 def get_encoder_labels(X_train, y_train):
     # mean of the digits
-    do_avg = np.vectorize(np.average)
+    do_avg = np.vectorize(np.mean)
     return do_avg(y_train)
-    # return np.mean(y_train, axis=1)  # TODO less dumb labels
+    # do_sum = np.vectorize(np.sum)
+    # return do_sum(y_train)
 
 
 def train_non_random(X, y, metafeatures, set_encoder, encoder, aggregator, budget=100, pool_size=100):
@@ -207,12 +210,14 @@ def train_non_random(X, y, metafeatures, set_encoder, encoder, aggregator, budge
 
 def entropy_selector(batches, model):
     predictions = model.predict(batches.reshape(-1, batches.shape[-1])).reshape(batches.shape[0], batches.shape[1], -1)
-    return np.argmax(np.mean(-np.sum(predictions * np.log2(predictions), axis=1), axis=1))
+    return np.argmax(np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=1), axis=1))
 
 
 def margin_selector(batches, model):
     predictions = model.predict(batches.reshape(-1, batches.shape[-1])).reshape(batches.shape[0], batches.shape[1], -1)
     sorted_predictions = np.sort(predictions, axis=1)
+    if sorted_predictions.shape[1] == 1:
+        return np.argmin(np.mean(sorted_predictions[:, -1], axis=1))
     return np.argmin(np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2], axis=1))
 
 
@@ -257,6 +262,13 @@ class BatchGenerator:
         next_y = self.y[self.n]
         return next_X, next_y
 
+    def add(self, data, labels, metafeatures):
+        self.selected_X.append(data)
+        self.selected_y.append(labels)
+        self.selected_mfs.append(metafeatures)
+        self.budget += len(data)
+        self.used += len(data)
+
     def regenerate(self):
         if self.finished:
             return
@@ -276,8 +288,10 @@ class BatchGenerator:
         self.metafeatures = np.delete(self.metafeatures, indices, axis=0)
 
         self.n = 0
-        if self.budget - self.size < self.used:
+        if self.budget == self.used:
             self.finished = True
+        elif self.budget - self.size < self.used:
+            self.X, self.y, self.mfs, self.indices = generate_batches(self.data, self.labels, self.count, (self.budget - self.used, self.budget - self.used), self.metafeatures, self.aggregator)
         else:
             self.X, self.y, self.mfs, self.indices = generate_batches(self.data, self.labels, self.count, (self.size, self.size), self.metafeatures, self.aggregator)
 
@@ -315,9 +329,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
         for i in range(regime_iterations):
             primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
             data_generator = BatchGenerator(X, y, budget, 1000, batch_size, mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
-            data_generator.selected_mfs.append(pool_mfs)
-            data_generator.selected_X.append(pool_X)
-            data_generator.selected_y.append(pool_y)
+            data_generator.add(pool_X, pool_y, pool_mfs)
             initial_loss = None
             writer = SummaryWriter("runs/" f"{regime.__name__}" f"{i+1}")
             batch = 0
@@ -347,7 +359,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
                     pool_metafeatures = pool_metafeatures.reshape(1, pool_metafeatures.shape[0], pool_metafeatures.shape[-1])
                     pool_metafeatures = np.array(aggregator(pool_metafeatures)).flatten()
                     predictions = primary_model.predict(x, verbose=0)
-                    entropy = np.array([np.mean(-np.sum(predictions * np.log2(predictions), axis=1))])
+                    entropy = np.array([np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=1))])
                     sorted_predictions = np.sort(predictions, axis=1)
                     margin = np.array([np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2])])
                     confidence = np.array([np.mean(1 - np.max(predictions, axis=1))])
@@ -362,30 +374,48 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
                         surrogate_y.append(initial_loss - val_loss)
                         surrogate_y_hat.append(initial_loss - val_loss_hat)
                         initial_loss = val_loss
-                    writer.add_scalar('loss_change', val_loss, batch)
-                    writer.add_scalar('accuracy', accuracy, batch)
-                    writer.add_scalar('loss_hat_change', val_loss_hat, batch)
-                    writer.add_scalar('hat_accuracy', accuracy_hat, batch)
+                    writer.add_scalar('loss_change', val_loss, data_generator.used)
+                    writer.add_scalar('accuracy', accuracy, data_generator.used)
+                    writer.add_scalar('loss_hat_change', val_loss_hat, data_generator.used)
+                    writer.add_scalar('hat_accuracy', accuracy_hat, data_generator.used)
             except StopIteration:
                 with open(surrogate_data_file, 'wb') as f:
                     pickle.dump((surrogate_X, surrogate_y, surrogate_y_hat), f)
 
 
-def set_generator_n(data_generator, primary_model, surrogate_model):
-    return 0
+def set_generator_n(data_generator, primary_model, surrogate_model, scaler):
+    # TODO
+    # Generate various features for surrogate model inputs
+    pool_metafeatures = np.concatenate(data_generator.selected_mfs)
+    pool_metafeatures = pool_metafeatures.reshape(1, pool_metafeatures.shape[0], pool_metafeatures.shape[-1])
+    pool_metafeatures = np.tile(np.array(data_generator.aggregator(pool_metafeatures)).flatten(), (data_generator.indices.shape[0], 1))
+    predictions = primary_model.predict(data_generator.X.reshape(-1, data_generator.X.shape[-1]), verbose=0).reshape(data_generator.X.shape[0], data_generator.X.shape[1], -1)
+    entropy = np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=2), axis=1).reshape(-1, 1)
+    sorted_predictions = np.sort(predictions, axis=2)
+    if sorted_predictions.shape[1] == 1:
+        margin = np.mean(sorted_predictions[:, -1], axis=1).reshape(-1, 1)
+    else:
+        margin = np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2], axis=1).reshape(-1, 1)
+    confidence = np.mean(1 - np.max(predictions, axis=2), axis=1).reshape(-1, 1)
+    used = np.tile([data_generator.used], (data_generator.indices.shape[0], 1))
+    histogram = np.array([np.mean([np.histogram(predictions[j, :, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[-1])], axis=0) for j in range(predictions.shape[0])])
+    surrogate_in = scaler.transform(np.concatenate((data_generator.mfs, pool_metafeatures, entropy, margin, confidence, used, histogram), axis=1))
+    return np.argmax(surrogate_model.predict(surrogate_in)[:, 0])
 
 
 def train_surrogate(data, labels, metafeatures, set_encoder, encoder, aggregator, surrogate_data, targets, targets_hat, budget=1000, pool_size=100):
     # Simple surrogate model
     surrogate_in = Input(shape=surrogate_data[0].shape[-1])
     surrogate_hidden = Dense(64, activation='relu')(surrogate_in)
-    surrogate_hidden = Dense(64, activation='relu')(surrogate_hidden)
+    # surrogate_hidden = Dense(64, activation='relu')(surrogate_hidden)
     surrogate_out = Dense(2)(surrogate_hidden)
     surrogate_model = Model(surrogate_in, surrogate_out)
     surrogate_model.compile(optimizer='adam', loss='mae')
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, verbose=0, patience=20, min_lr=0.000001)
-    surrogate_model.fit(np.array(surrogate_data), np.column_stack((targets, targets_hat)), epochs=1, validation_split=0.15, callbacks=[reduce_lr])
 
+    scaler = StandardScaler()
+    surrogate_data = scaler.fit_transform(surrogate_data)
+    surrogate_model.fit(surrogate_data, np.column_stack((targets, targets_hat)), epochs=300, validation_split=0.15, callbacks=[reduce_lr])
     regimes = [random_selector, entropy_selector, margin_selector, confidence_selector, uniform_selector]
     regime_iterations = 10
 
@@ -408,18 +438,16 @@ def train_surrogate(data, labels, metafeatures, set_encoder, encoder, aggregator
 
     primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
     data_generator = BatchGenerator(X, y, budget, 1000, batch_size, mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
-    data_generator.selected_mfs.append(pool_mfs)
-    data_generator.selected_X.append(pool_X)
-    data_generator.selected_y.append(pool_y)
+    data_generator.add(pool_X, pool_y, pool_mfs)
 
-    writer = SummaryWriter("runs/surrogate")
+    writer = SummaryWriter("runs/surrogate_both")
     batch = 0
     labeled_X = pool_X
     labeled_y = pool_y
     try:  # Iterators are supposed to throw StopIteration exception when they reach the end
         while True:  # This goes until budget is exhausted
             batch += 1
-            data_generator.n = set_generator_n(data_generator, primary_model, surrogate_model)  # Sets the new batch
+            data_generator.n = set_generator_n(data_generator, primary_model, surrogate_model, scaler)  # Sets the new batch
             x, label = next(data_generator)  # get the batch
             labeled_X = np.vstack((labeled_X, x))
             labeled_y = np.concatenate((labeled_y, label))
@@ -429,8 +457,8 @@ def train_surrogate(data, labels, metafeatures, set_encoder, encoder, aggregator
 
             data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
 
-            writer.add_scalar('loss_change', val_loss, batch)
-            writer.add_scalar('accuracy', accuracy, batch)
+            writer.add_scalar('loss_change', val_loss, data_generator.used)
+            writer.add_scalar('accuracy', accuracy, data_generator.used)
     except StopIteration:
         pass
 
@@ -487,13 +515,14 @@ def main():
         # save weights
         with open(set_encoder_file, 'wb') as output:
             pickle.dump(deep_we, output)
-
+        return 0
     encoder, aggregator = split_model(set_encoder)
     instance_mfs = np.squeeze(encoder.predict(np.expand_dims(data.data, 1)), 1)
 
     surrogate_X, surrogate_y, surrogate_y_hat = None, None, None
     if not os.path.isfile(surrogate_data_file):
         pretrain(data.data, data.target, instance_mfs, set_encoder, encoder, aggregator)
+        return 0
     with open(surrogate_data_file, 'rb') as input:
         surrogate_X, surrogate_y, surrogate_y_hat = pickle.load(input)
     train_surrogate(data.data, data.target, instance_mfs, set_encoder, encoder, aggregator, surrogate_X, surrogate_y, surrogate_y_hat)
