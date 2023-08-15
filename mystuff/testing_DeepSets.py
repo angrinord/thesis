@@ -3,10 +3,10 @@ import pickle
 import random
 from logging import warning
 from typing import Iterator
-
+import xgboost as xgb
 import numpy as np
 import keras.backend as K
-import tensorflow
+import tensorflow as tf
 from keras import Sequential, backend
 from keras.layers import Input, Dense, Lambda, TimeDistributed
 from keras.models import Model, clone_model
@@ -14,19 +14,21 @@ from keras.optimizers import Adam
 from keras.callbacks import ReduceLROnPlateau, TensorBoard, Callback, EarlyStopping
 from keras.utils import io_utils, Sequence
 from scipy import stats
+from scipy.integrate import simps
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils import shuffle
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 batch_count = 2000
 batch_size = 10
-set_enc_range = (2, 64)
-super_batch_count = 150
+set_enc_range = (2, 32)
 primary_epochs = 10
-set_encoder_file = "deepset1.pkl"
-surrogate_data_file = "surrogate_data2.pkl"
+set_encoder_file = "deepset_with mean.pkl"
+surrogate_data_file = "surrogate_data_fixed.pkl"
+evaluation_file = "evaluations.pkl"
 sigma = 1e-10
 
 
@@ -35,14 +37,14 @@ def get_deepset_model(data_dim, images=None):  # NOTE: Passing images is only ne
 
     # Encoder
     # TimeDistributed should leave the latent features uncorrelated across instances.
-    input_img = Input(shape=(None, data_dim, ))
-    x = TimeDistributed(Dense(300, activation='tanh'))(input_img)
-    x = TimeDistributed(Dense(100, activation='tanh'))(x)
-    x = TimeDistributed(Dense(30, activation='tanh'))(x)
+    input_img = Input(shape=(None, data_dim,))
+    x = TimeDistributed(Dense(256, activation='tanh'))(input_img)
+    x = TimeDistributed(Dense(128, activation='tanh'))(x)
+    x = TimeDistributed(Dense(32, activation='tanh'))(x)
 
     # Aggregator
     x = backend.mean(x, axis=1)
-    x = Dense(30)(x)
+    x = Dense(32)(x)
 
     model = Model(input_img, x)
     model.compile(optimizer=adam, loss='mae')
@@ -52,7 +54,7 @@ def get_deepset_model(data_dim, images=None):  # NOTE: Passing images is only ne
 
 
 def split_model(model, X=None, split=4):  # NOTE: Passing X is only necessary for testing.
-    split_index = 2*(split-1)
+    split_index = 2 * (split - 1)
 
     # Encoder is half of set encoder that is done instance-wise
     encoder_layers = model.layers[:split]
@@ -64,7 +66,7 @@ def split_model(model, X=None, split=4):  # NOTE: Passing X is only necessary fo
     # TODO generalize to arbitrary architecture.  Right now this breaks if arch of set encoder changes.
     agg_in = Input(shape=encoder_model.output_shape[1:])
     agg_x = backend.mean(agg_in, axis=1)
-    agg_x = Dense(30)(agg_x)
+    agg_x = Dense(32)(agg_x)
     aggregator_model = Model(agg_in, agg_x)
     aggregator_model.set_weights(model.get_weights()[split_index:])
 
@@ -107,9 +109,9 @@ def batch_pool(pool_X, pool_y, pool_mfs, size, aggregator):
     assert len(pool_X) == len(pool_X) == len(pool_mfs)
     length = len(pool_X)
     p = np.random.permutation(length)
-    pool_X = np.reshape(pool_X[p], (length//size, size, pool_X.shape[-1]))
-    pool_y = np.reshape(pool_y[p], (length//size, size))
-    pool_mfs = aggregator(np.reshape(pool_mfs[p], (length//size, size, pool_mfs.shape[-1])))
+    pool_X = np.reshape(pool_X[p], (length // size, size, pool_X.shape[-1]))
+    pool_y = np.reshape(pool_y[p], (length // size, size))
+    pool_mfs = aggregator(np.reshape(pool_mfs[p], (length // size, size, pool_mfs.shape[-1])))
     return pool_X, pool_y, pool_mfs
 
 
@@ -182,7 +184,7 @@ def train_non_random(X, y, metafeatures, set_encoder, encoder, aggregator, budge
         new_loss = primary_model.evaluate(pool_X, pool_y)
 
         # Fit and evaluate surrogate on impact new batch had on loss
-        surrogate_y.append(np.array(old_loss-new_loss).reshape((-1, 1)))
+        surrogate_y.append(np.array(old_loss - new_loss).reshape((-1, 1)))
         surrogate_model.fit(np.stack(train_mfs), np.concatenate(surrogate_y), epochs=primary_epochs, verbose=0)  # Should epoch be 1?
 
         old_loss = new_loss
@@ -215,15 +217,13 @@ def entropy_selector(batches, model):
 
 def margin_selector(batches, model):
     predictions = model.predict(batches.reshape(-1, batches.shape[-1])).reshape(batches.shape[0], batches.shape[1], -1)
-    sorted_predictions = np.sort(predictions, axis=1)
-    if sorted_predictions.shape[1] == 1:
-        return np.argmin(np.mean(sorted_predictions[:, -1], axis=1))
-    return np.argmin(np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2], axis=1))
+    sorted_predictions = np.sort(predictions, axis=2)
+    return np.argmin(np.mean(sorted_predictions[:, :, -1] - sorted_predictions[:, :, -2], axis=1))
 
 
 def confidence_selector(batches, model):
     predictions = model.predict(batches.reshape(-1, batches.shape[-1])).reshape(batches.shape[0], batches.shape[1], -1)
-    return np.argmin(np.mean(1 - np.max(predictions, axis=1), axis=1))
+    return np.argmin(np.mean(np.max(predictions, axis=1), axis=1))
 
 
 def random_selector(batches, model):
@@ -303,41 +303,43 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
     surrogate_y = []
     surrogate_y_hat = []
 
-    X, val_X, y, val_y, mfs, _ = train_test_split(data, labels, metafeatures, test_size=0.0123456789)
+    X, val_X, y, val_y, mfs, _ = train_test_split(data, labels, metafeatures, test_size=0.015)
 
-    # Initial Training Pool
-    pool_X, X = X[:pool_size], X[pool_size:]
-    pool_y, y = y[:pool_size], y[pool_size:]
-    pool_mfs, mfs = mfs[:pool_size], mfs[pool_size:]
+    # Train model using given selection heuristic multiple times
+    for i in range(regime_iterations):
+        np.random.seed(i)
+        tf.random.set_seed(i)
+        # Initial Training Pool
+        X, y, mfs = shuffle(X, y, mfs, random_state=i)
+        pool_X, unlabeled_X = X[:pool_size], X[pool_size:]
+        pool_y, unlabeled_y = y[:pool_size], y[pool_size:]
+        pool_mfs, unlabeled_mfs = mfs[:pool_size], mfs[pool_size:]
 
-    # Simple primary model
-    primary_in = Input(shape=set_encoder.input_shape[-1])
-    primary_hidden = Dense(32, activation='relu')(primary_in)
-    primary_hidden = Dense(32, activation='relu')(primary_hidden)
-    primary_out = Dense(10, activation='softmax')(primary_hidden)
-    primary_model = Model(primary_in, primary_out)
-    primary_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    primary_model.fit(pool_X, pool_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)])
-    pool_weights = primary_model.get_weights()
+        # Simple primary model
+        primary_in = Input(shape=set_encoder.input_shape[-1])
+        primary_hidden = Dense(32, activation='relu')(primary_in)
+        primary_hidden = Dense(32, activation='relu')(primary_hidden)
+        primary_out = Dense(10, activation='softmax')(primary_hidden)
+        primary_model = Model(primary_in, primary_out)
+        primary_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        one_step_model = clone_model(primary_model)
+        one_step_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
-    one_step_model = clone_model(primary_model)
-    one_step_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        primary_model.fit(pool_X, pool_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)])
+        pool_weights = primary_model.get_weights()
 
-    # Iterate over different batch selection heuristics
-    for regime in regimes:
-        # Train model using given selection heuristic multiple times
-        for i in range(regime_iterations):
+        # Iterate over different batch selection heuristics
+        for regime in regimes:
+            print(regime.__name__)
             primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
-            data_generator = BatchGenerator(X, y, budget, 1000, batch_size, mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
+            data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, 1000, batch_size, unlabeled_mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
             data_generator.add(pool_X, pool_y, pool_mfs)
             initial_loss = None
-            writer = SummaryWriter("runs/" f"{regime.__name__}" f"{i+1}")
-            batch = 0
+            writer = SummaryWriter("runs/" f"{regime.__name__}" f"{i + 1}")
             labeled_X = pool_X
             labeled_y = pool_y
             try:  # Iterators are supposed to throw StopIteration exception when they reach the end
                 while True:  # This goes until budget is exhausted
-                    batch += 1
                     data_generator.n = regime(data_generator.X, primary_model)  # Sets the new batch
                     x, label = next(data_generator)  # get the batch
                     batch_metafeatures = data_generator.mfs[data_generator.n]  # Metafeature vector for the current batch
@@ -362,7 +364,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
                     entropy = np.array([np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=1))])
                     sorted_predictions = np.sort(predictions, axis=1)
                     margin = np.array([np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2])])
-                    confidence = np.array([np.mean(1 - np.max(predictions, axis=1))])
+                    confidence = np.array([np.mean(np.max(predictions, axis=1))])
                     used = np.array([data_generator.used])
                     histogram = np.mean([np.histogram(predictions[:, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[1])], axis=0)
                     surrogate_in = np.concatenate((batch_metafeatures, pool_metafeatures, entropy, margin, confidence, used, histogram))
@@ -392,75 +394,135 @@ def set_generator_n(data_generator, primary_model, surrogate_model, scaler):
     predictions = primary_model.predict(data_generator.X.reshape(-1, data_generator.X.shape[-1]), verbose=0).reshape(data_generator.X.shape[0], data_generator.X.shape[1], -1)
     entropy = np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=2), axis=1).reshape(-1, 1)
     sorted_predictions = np.sort(predictions, axis=2)
-    if sorted_predictions.shape[1] == 1:
-        margin = np.mean(sorted_predictions[:, -1], axis=1).reshape(-1, 1)
-    else:
-        margin = np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2], axis=1).reshape(-1, 1)
-    confidence = np.mean(1 - np.max(predictions, axis=2), axis=1).reshape(-1, 1)
+    margin = np.mean(sorted_predictions[:, :, -1] - sorted_predictions[:, :, -2], axis=1).reshape(-1, 1)
+    confidence = np.mean(np.max(predictions, axis=2), axis=1).reshape(-1, 1)
     used = np.tile([data_generator.used], (data_generator.indices.shape[0], 1))
     histogram = np.array([np.mean([np.histogram(predictions[j, :, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[-1])], axis=0) for j in range(predictions.shape[0])])
-    surrogate_in = scaler.transform(np.concatenate((data_generator.mfs, pool_metafeatures, entropy, margin, confidence, used, histogram), axis=1))
+    surrogate_in = xgb.DMatrix(scaler.transform(np.concatenate((data_generator.mfs, pool_metafeatures, entropy, margin, confidence, used, histogram), axis=1)))
     return np.argmax(surrogate_model.predict(surrogate_in)[:, 0])
 
 
 def train_surrogate(data, labels, metafeatures, set_encoder, encoder, aggregator, surrogate_data, targets, targets_hat, budget=1000, pool_size=100):
-    # Simple surrogate model
-    surrogate_in = Input(shape=surrogate_data[0].shape[-1])
-    surrogate_hidden = Dense(64, activation='relu')(surrogate_in)
-    # surrogate_hidden = Dense(64, activation='relu')(surrogate_hidden)
-    surrogate_out = Dense(2)(surrogate_hidden)
-    surrogate_model = Model(surrogate_in, surrogate_out)
-    surrogate_model.compile(optimizer='adam', loss='mae')
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, verbose=0, patience=20, min_lr=0.000001)
-
+    param = {
+        'objective': 'reg:squarederror',  # Learning task and loss function
+        'eval_metric': 'rmse',  # Metric for evaluation
+        'n_estimators': 100,  # Number of boosting rounds (trees)
+        'learning_rate': 0.1,  # Step size at each iteration
+        'max_depth': 3,  # Maximum depth of a tree
+        'min_child_weight': 1,  # Minimum sum of instance weight in a child node
+        'subsample': 1.0,  # Fraction of samples used for training each tree
+        'colsample_bytree': 1.0,  # Fraction of features used for training each tree
+        'gamma': 0,  # Minimum loss reduction required for further partition
+        'seed': 0  # Random seed for reproducibility
+    }
+    surrogate_X, surrogate_val_X, surrogate_y, surrogate_val_y = train_test_split(surrogate_data, np.column_stack((targets, targets_hat)), test_size=0.015)
     scaler = StandardScaler()
-    surrogate_data = scaler.fit_transform(surrogate_data)
-    surrogate_model.fit(surrogate_data, np.column_stack((targets, targets_hat)), epochs=300, validation_split=0.15, callbacks=[reduce_lr])
+    surrogate_data = scaler.fit_transform(surrogate_X)
+    surrogate_val_X = scaler.transform(surrogate_val_X)
+    dtrain = xgb.DMatrix(surrogate_data, label=surrogate_y)
+    evallist = [(xgb.DMatrix(surrogate_val_X, label=surrogate_val_y), "val")]
+    num_rounds = 300
+    surrogate_model = xgb.train(param, dtrain, num_rounds, evallist, early_stopping_rounds=20)
+
     regimes = [random_selector, entropy_selector, margin_selector, confidence_selector, uniform_selector]
     regime_iterations = 10
 
-    X, val_X, y, val_y, mfs, _ = train_test_split(data, labels, metafeatures, test_size=0.0123456789)
+    X, val_X, y, val_y, mfs, _ = train_test_split(data, labels, metafeatures, test_size=0.015)
 
-    # Initial Training Pool
-    pool_X, X = X[:pool_size], X[pool_size:]
-    pool_y, y = y[:pool_size], y[pool_size:]
-    pool_mfs, mfs = mfs[:pool_size], mfs[pool_size:]
+    ###########################
 
-    # Simple primary model
-    primary_in = Input(shape=set_encoder.input_shape[-1])
-    primary_hidden = Dense(32, activation='relu')(primary_in)
-    primary_hidden = Dense(32, activation='relu')(primary_hidden)
-    primary_out = Dense(10, activation='softmax')(primary_hidden)
-    primary_model = Model(primary_in, primary_out)
-    primary_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    primary_model.fit(pool_X, pool_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)])
-    pool_weights = primary_model.get_weights()
+    evaluations = {}
 
-    primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
-    data_generator = BatchGenerator(X, y, budget, 1000, batch_size, mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
-    data_generator.add(pool_X, pool_y, pool_mfs)
+    # Train model using given selection heuristic multiple times
+    for i in range(regime_iterations):
+        np.random.seed(i)
+        tf.random.set_seed(i)
+        # Initial Training Pool
+        X, y, mfs = shuffle(X, y, mfs, random_state=i)
+        pool_X, unlabeled_X = X[:pool_size], X[pool_size:]
+        pool_y, unlabeled_y = y[:pool_size], y[pool_size:]
+        pool_mfs, unlabeled_mfs = mfs[:pool_size], mfs[pool_size:]
 
-    writer = SummaryWriter("runs/surrogate_both")
-    batch = 0
-    labeled_X = pool_X
-    labeled_y = pool_y
-    try:  # Iterators are supposed to throw StopIteration exception when they reach the end
-        while True:  # This goes until budget is exhausted
-            batch += 1
-            data_generator.n = set_generator_n(data_generator, primary_model, surrogate_model, scaler)  # Sets the new batch
-            x, label = next(data_generator)  # get the batch
-            labeled_X = np.vstack((labeled_X, x))
-            labeled_y = np.concatenate((labeled_y, label))
+        # Simple primary model
+        primary_in = Input(shape=set_encoder.input_shape[-1])
+        primary_hidden = Dense(32, activation='relu')(primary_in)
+        primary_hidden = Dense(32, activation='relu')(primary_hidden)
+        primary_out = Dense(10, activation='softmax')(primary_hidden)
+        primary_model = Model(primary_in, primary_out)
+        primary_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        one_step_model = clone_model(primary_model)
+        one_step_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
-            primary_model.fit(labeled_X, labeled_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)], verbose=0)
-            val_loss, accuracy = primary_model.evaluate(val_X, val_y)
+        primary_model.fit(pool_X, pool_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)])
+        pool_weights = primary_model.get_weights()
 
-            data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
+        # Iterate over different batch selection heuristics
+        for regime in regimes:
+            primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
+            data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, 1000, batch_size, unlabeled_mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
+            data_generator.add(pool_X, pool_y, pool_mfs)
+            writer = SummaryWriter("runs/new/" f"{regime.__name__}" f"{i + 1}")
+            labeled_X = pool_X
+            labeled_y = pool_y
+            values = []
+            indices = []
+            aucs = []
+            try:  # Iterators are supposed to throw StopIteration exception when they reach the end
+                while True:  # This goes until budget is exhausted
+                    data_generator.n = regime(data_generator.X, primary_model)  # Sets the new batch
+                    x, label = next(data_generator)  # get the batch
+                    batch_metafeatures = data_generator.mfs[data_generator.n]  # Metafeature vector for the current batch
+                    labeled_X = np.vstack((labeled_X, x))
+                    labeled_y = np.concatenate((labeled_y, label))
 
-            writer.add_scalar('loss_change', val_loss, data_generator.used)
-            writer.add_scalar('accuracy', accuracy, data_generator.used)
-    except StopIteration:
-        pass
+                    primary_model.fit(labeled_X, labeled_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)], verbose=0)
+                    val_loss, accuracy = primary_model.evaluate(val_X, val_y)
+
+                    data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
+                    values.append(accuracy)
+                    indices.append(data_generator.used)
+                    auc = simps(values, x=indices)
+                    aucs.append(auc)
+                    writer.add_scalar('auc', auc, data_generator.used)
+                    writer.add_scalar('loss_change', val_loss, data_generator.used)
+                    writer.add_scalar('accuracy', accuracy, data_generator.used)
+            except StopIteration:
+                with open(evaluation_file, 'wb') as f:
+                    evaluations[f"{regime.__name__}" f"{i + 1}"] = auc
+                    pickle.dump(evaluations, f)
+        # Surrogate part
+        primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
+        data_generator = BatchGenerator(X, y, budget, 1000, batch_size, mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
+        data_generator.add(pool_X, pool_y, pool_mfs)
+
+        writer = SummaryWriter("runs/new/surrogate" f"{i + 1}")
+        labeled_X = pool_X
+        labeled_y = pool_y
+        values = []
+        indices = []
+        aucs = []
+        try:  # Iterators are supposed to throw StopIteration exception when they reach the end
+            while True:  # This goes until budget is exhausted
+                data_generator.n = set_generator_n(data_generator, primary_model, surrogate_model, scaler)  # Sets the new batch
+                x, label = next(data_generator)  # get the batch
+                labeled_X = np.vstack((labeled_X, x))
+                labeled_y = np.concatenate((labeled_y, label))
+
+                primary_model.fit(labeled_X, labeled_y, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=20)], verbose=0)
+                val_loss, accuracy = primary_model.evaluate(val_X, val_y)
+
+                data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
+                values.append(accuracy)
+                indices.append(data_generator.used)
+                auc = simps(values, x=indices)
+                aucs.append(auc)
+                writer.add_scalar('auc', auc, data_generator.used)
+                writer.add_scalar('loss_change', val_loss, data_generator.used)
+                writer.add_scalar('accuracy', accuracy, data_generator.used)
+        except StopIteration:
+            with open(evaluation_file, 'wb') as f:
+                evaluations["surrogate" f"{i + 1}"] = auc
+                pickle.dump(evaluations, f)
 
 
 class MyTensorBoard(TensorBoard):
