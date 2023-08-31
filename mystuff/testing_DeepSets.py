@@ -27,7 +27,7 @@ batch_size = 10
 set_enc_range = (2, 32)
 primary_epochs = 10
 set_encoder_file = "deepset_with mean.pkl"
-surrogate_data_file = "surrogate_data_fixed.pkl"
+surrogate_data_file = "surrogate_data_blah.pkl"
 evaluation_file = "evaluations.pkl"
 sigma = 1e-10
 
