@@ -34,10 +34,8 @@ batch_count = 2000
 batch_size = 20
 set_enc_range = (2, 32)
 primary_epochs = 10
-set_encoder_file = "deepset_with mean.pkl"
-surrogate_data_file = "surrogate_data_fixed.pkl"
-evaluation_file = "evaluations.pkl"
-predictor_checkpoint_dir = 'results/predictor/model'
+surrogate_data_file = "../../mystuff/surrogate_data_rapidNAS.pkl"
+evaluation_file = "../../mystuff/evaluations.pkl"
 sigma = 1e-10
 encodings_dir = 'data'
 directory = encodings_dir
@@ -55,7 +53,7 @@ def generate_batches(data, labels, count, size, aggregator=None):
         random_balanced_indices = []
         for i in range(num_classes):
             random_balanced_indices.append(tf.random.shuffle(class_indices[i])[:size//num_classes])
-        random_balanced_indices = tf.transpose(tf.concat(random_balanced_indices, axis=1), [1,0])
+        random_balanced_indices = tf.transpose(tf.concat(random_balanced_indices, axis=1), [1, 0])
         batch_data = tf.gather(data, random_balanced_indices)
         batch_y = tf.gather(labels, random_balanced_indices)
 
@@ -123,9 +121,8 @@ class BatchGenerator:
         self.budget = budget
         self.used = 0
         self.X, self.y, self.mfs, self.indices = generate_batches(self.data, self.labels, self.count, self.size, self.aggregator)
-        self.selected_X = []
-        self.selected_y = []
-        self.selected_mfs = []
+        self.selected = {}
+        self.classes = list(range(self.labels.shape[-1]))
 
     def __iter__(self):
         return self
@@ -137,11 +134,16 @@ class BatchGenerator:
         next_y = self.y[self.n]
         return next_X, next_y
 
-    def add(self, data, labels):
-        self.selected_X.append(data)
-        self.selected_y.append(labels)
-        self.budget += len(data)
-        self.used += len(data)
+    def add(self, data, labels, budgeted=False):
+        label_indices = tf.argmax(labels, axis=1)
+        for i in self.classes:
+            if i in self.selected.keys():
+                self.selected[i] = tf.concat([self.selected[i], tf.squeeze(tf.gather(data, tf.where(tf.equal(label_indices, i))), 1)], axis=0)
+            else:
+                self.selected[i] = tf.squeeze(tf.gather(data, tf.where(tf.equal(label_indices, i))), 1)
+        if not budgeted:
+            self.used += len(data)
+            self.budget += len(data)
 
     def regenerate(self):
         if self.finished:
@@ -149,15 +151,15 @@ class BatchGenerator:
         io_utils.print_msg(
             "Remaining Budget: "
             f"{self.budget - self.used:.2f}")
-        # TODO
         indices = self.indices[self.n]
         self.used += len(np.unique(indices))
 
-        self.selected_X.append(self.data[indices])
-        self.selected_y.append(self.labels[indices])
+        selected_X = tf.gather(self.data, indices)
+        selected_y = tf.gather(self.labels, indices)
+        self.add(selected_X, selected_y, budgeted=True)
 
-        self.data = np.delete(self.data, indices, axis=0)
-        self.labels = np.delete(self.labels, indices, axis=0)
+        self.data = tf.boolean_mask(self.data, ~tf.reduce_any(tf.equal(tf.range(tf.shape(self.data)[0], dtype=tf.int64), indices[:, tf.newaxis]), axis=0))
+        self.labels = tf.boolean_mask(self.labels, ~tf.reduce_any(tf.equal(tf.range(tf.shape(self.labels)[0], dtype=tf.int64), indices[:, tf.newaxis]), axis=0))
 
         self.n = 0
         if self.budget == self.used:
@@ -166,6 +168,14 @@ class BatchGenerator:
             self.X, self.y, self.mfs, self.indices = generate_batches(self.data, self.labels, self.count, self.budget - self.used, self.aggregator)
         else:
             self.X, self.y, self.mfs, self.indices = generate_batches(self.data, self.labels, self.count, self.size, self.aggregator)
+
+    def get_selected(self):
+        length = max(self.selected.values(), key=tf.size).shape[0]
+        selected = []
+        for i, tensor in self.selected.items():
+            paddings = tf.constant([[0, length - tensor.shape[0]], [0, 0]])
+            selected.append(tf.pad(tensor, paddings, constant_values=0))
+        return tf.stack(selected)
 
 
 def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budget=1000, pool_size=100):
@@ -229,7 +239,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
                     data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
 
                     # Generate various features for surrogate model inputs
-                    pool_metafeatures = np.concatenate(data_generator.selected_mfs)
+                    pool_metafeatures = np.concatenate(data_generator.selected)
                     pool_metafeatures = pool_metafeatures.reshape(1, pool_metafeatures.shape[0], pool_metafeatures.shape[-1])
                     pool_metafeatures = np.array(aggregator(pool_metafeatures)).flatten()
                     predictions = primary_model.predict(x, verbose=0)
@@ -260,7 +270,7 @@ def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, budge
 def set_generator_n(data_generator, primary_model, surrogate_model, scaler):
     # TODO
     # Generate various features for surrogate model inputs
-    pool_metafeatures = np.concatenate(data_generator.selected_mfs)
+    pool_metafeatures = np.concatenate(data_generator.selected)
     pool_metafeatures = pool_metafeatures.reshape(1, pool_metafeatures.shape[0], pool_metafeatures.shape[-1])
     pool_metafeatures = np.tile(np.array(data_generator.aggregator(pool_metafeatures)).flatten(), (data_generator.indices.shape[0], 1))
     predictions = primary_model.predict(data_generator.X.reshape(-1, data_generator.X.shape[-1]), verbose=0).reshape(data_generator.X.shape[0], data_generator.X.shape[1], -1)
@@ -333,7 +343,7 @@ def train_surrogate(data, labels, metafeatures, set_encoder, encoder, aggregator
             primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
             data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, 1000, batch_size, unlabeled_mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
             data_generator.add(pool_X, pool_y, pool_mfs)
-            writer = SummaryWriter("runs/new/" f"{regime.__name__}" f"{i + 1}")
+            writer = SummaryWriter("../mystuff/runs2/new/" f"{regime.__name__}" f"{i + 1}")
             labeled_X = pool_X
             labeled_y = pool_y
             values = []
@@ -409,8 +419,9 @@ NUM_RANDOM_BATCHES = 17
 
 
 def foo_real(intra_setpool, inter_setpool, data, budget=1000, pool_size=100):
-    EPOCHS=1
+    EPOCHS=10000
     torch.manual_seed(0)
+    tf.random.set_seed(0)
     test_ratio = 0.1
     regimes = [random_selector, entropy_selector, margin_selector, confidence_selector, uniform_selector]
     regime_iterations = 10
@@ -431,7 +442,7 @@ def foo_real(intra_setpool, inter_setpool, data, budget=1000, pool_size=100):
     val_y = tf.gather(label_tensor, val_indices)
 
     for i in range(regime_iterations):
-        np.random.seed(i)
+        torch.manual_seed(i)
         tf.random.set_seed(i)
 
         shuffled_indices = tf.random.shuffle(tf.range(X.shape[0]))
@@ -453,13 +464,12 @@ def foo_real(intra_setpool, inter_setpool, data, budget=1000, pool_size=100):
             data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, 17, batch_size, (intra_setpool, inter_setpool))  # Generate 1000 random batches from remaining unlabelled pool
             data_generator.add(pool_X, pool_y)
             initial_loss = None
-            # writer = SummaryWriter("runs/" f"{regime.__name__}" f"{i + 1}")
+            writer = SummaryWriter("../../mystuff/runs2/" f"{regime.__name__}" f"{i + 1}")
             labeled_X = pool_X
             labeled_y = pool_y
 
             try:
                 while True:
-                    # TODO
                     data_generator.n = regime(data_generator.X, primary_model)  # Sets the new batch
                     x, label = next(data_generator)  # get the batch
                     batch_metafeatures = data_generator.mfs[data_generator.n]  # Metafeature vector for the current batch
@@ -475,43 +485,31 @@ def foo_real(intra_setpool, inter_setpool, data, budget=1000, pool_size=100):
                     val_loss, accuracy = primary_model.evaluate(val_X, val_y)
 
                     data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
+
+                    pool_metafeatures = inter_setpool(intra_setpool(torch.tensor(tf.stack(data_generator.get_selected()).numpy())).squeeze(1).unsqueeze(0)).squeeze().detach()
+                    predictions = primary_model.predict(x, verbose=0)
+                    entropy = np.array([np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=1))])
+                    sorted_predictions = np.sort(predictions, axis=1)
+                    margin = np.array([np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2])])
+                    confidence = np.array([np.mean(np.max(predictions, axis=1))])
+                    used = np.array([data_generator.used])
+                    histogram = np.mean([np.histogram(predictions[:, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[1])], axis=0)
+                    surrogate_in = tf.concat((batch_metafeatures, pool_metafeatures, entropy, margin, confidence, used, histogram), axis=0)
+
+                    if initial_loss is None:
+                        initial_loss = val_loss
+                    else:
+                        surrogate_X.append(surrogate_in)
+                        surrogate_y.append(initial_loss - val_loss)
+                        surrogate_y_hat.append(initial_loss - val_loss_hat)
+                        initial_loss = val_loss
+                    writer.add_scalar('loss_change', val_loss, data_generator.used)
+                    writer.add_scalar('accuracy', accuracy, data_generator.used)
+                    writer.add_scalar('loss_hat_change', val_loss_hat, data_generator.used)
+                    writer.add_scalar('hat_accuracy', accuracy_hat, data_generator.used)
             except StopIteration:
                 with open(surrogate_data_file, 'wb') as f:
                     pickle.dump((surrogate_X, surrogate_y, surrogate_y_hat), f)
-
-
-
-
-    # train the primary model on your labeled data
-    pseudo_labels = primary_model(unlabeled_x)
-    data_by_class = sort_by_class(unlabeled_x, pseudo_labels)
-    random_batches = []
-    for _ in range(NUM_RANDOM_BATCHES):
-        batch = []
-        classes = list(range(NUM_CLASSES))
-        for cls in classes:
-            cx = data_by_class[cls]
-            ids = torch.randperm(unlabeled_x.size(0))[:NUM_SAMPLES]
-            batch.append(cx[ids[:NUM_SAMPLES]])
-        batch = torch.stack(batch, dim=0)
-        random_batches.append(batch)
-    random_batches = torch.stack(random_batches, dim=0) # 17 x 10 x {1,2,20} x 512
-    # pass through the set pools
-    proto_batch = []
-    for x in random_batches:
-        cls_protos = intra_setpool(x).squeeze(1)
-        proto_batch.append(inter_setpool(cls_protos.unsqueeze(0)).squeeze())
-    proto_batch_unlabeled = torch.stack(proto_batch, dim=0) # 17 x 56
-    # pass through a batch selectors
-    selected_batch = None # 1 x 56
-
-    # encode the labeled set with rapid nas
-    proto_batch_labeled = None # 1 x 56
-
-    other_stuff = None
-    surrogate_data = torch.cat([selected_batch, proto_batch_labeled, other_stuff])
-    # pass it through the surrogate model
-    pass
 
 
 def main():
