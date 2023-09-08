@@ -168,11 +168,19 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
     num_test_samples = int(test_ratio * len(data_tensor))
     indices = tf.random.shuffle(tf.range(data_tensor.shape[0]))
     train_indices = indices[num_test_samples:]
+    test_indices = indices[:num_test_samples]
+    train_X = tf.gather(data_tensor, train_indices)
+    train_y = tf.gather(label_tensor, train_indices)
+    test_X = tf.gather(data_tensor, test_indices)
+    test_y = tf.gather(label_tensor, test_indices)
+
+    indices = tf.random.shuffle(tf.range(train_X.shape[0]))
+    train_indices = indices[num_test_samples:]
     val_indices = indices[:num_test_samples]
-    X = tf.gather(data_tensor, train_indices)
-    y = tf.gather(label_tensor, train_indices)
-    val_X = tf.gather(data_tensor, val_indices)
-    val_y = tf.gather(label_tensor, val_indices)
+    X = tf.gather(train_X, train_indices)
+    y = tf.gather(train_y, train_indices)
+    val_X = tf.gather(train_X, val_indices)
+    val_y = tf.gather(train_y, val_indices)
 
     torch.manual_seed(idx)
     tf.random.set_seed(idx)
@@ -199,9 +207,9 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
         writer = SummaryWriter("runs/" f"{regime.__name__}" f"{idx}")
         labeled_X = pool_X
         labeled_y = pool_y
-        val_loss, accuracy = primary_model.evaluate(val_X, val_y)
-        writer.add_scalar('loss_change', val_loss, data_generator.used)
-        writer.add_scalar('accuracy', accuracy, data_generator.used)
+        test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
+        writer.add_scalar('loss_change', test_loss, data_generator.used)
+        writer.add_scalar('accuracy', test_accuracy, data_generator.used)
         try:
             while True:
                 data_generator.n = regime(data_generator.X, primary_model)  # Sets the new batch
@@ -213,10 +221,12 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
                 one_step_model.set_weights(primary_model.get_weights())
                 one_step_model.train_on_batch(x, label)  # single gradient update on batch
                 val_loss_hat, accuracy_hat = one_step_model.evaluate(val_X, val_y, verbose=0)
+                test_loss_hat, test_accuracy_hat = one_step_model.evaluate(test_X, test_y, verbose=0)
 
                 # K.clear_session()
                 primary_model.fit(labeled_X, labeled_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)], verbose=0)
                 val_loss, accuracy = primary_model.evaluate(val_X, val_y)
+                test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
 
                 data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
 
@@ -237,10 +247,10 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
                     surrogate_y.append(initial_loss - val_loss)
                     surrogate_y_hat.append(initial_loss - val_loss_hat)
                     initial_loss = val_loss
-                writer.add_scalar('loss_change', val_loss, data_generator.used)
-                writer.add_scalar('accuracy', accuracy, data_generator.used)
-                writer.add_scalar('loss_hat_change', val_loss_hat, data_generator.used)
-                writer.add_scalar('hat_accuracy', accuracy_hat, data_generator.used)
+                writer.add_scalar('loss_change', test_loss, data_generator.used)
+                writer.add_scalar('accuracy', test_accuracy, data_generator.used)
+                writer.add_scalar('loss_hat_change', test_loss_hat, data_generator.used)
+                writer.add_scalar('hat_accuracy', test_accuracy_hat, data_generator.used)
         except StopIteration:
             with open(f'{directory}/{surrogate_data_filename}{idx}.pkl', 'wb') as f:
                 pickle.dump((surrogate_X, surrogate_y, surrogate_y_hat), f)
