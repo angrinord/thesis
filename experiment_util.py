@@ -14,7 +14,7 @@ print(F"The virtualenv is: {sys.prefix}\n")
 # fixing hdf5 file writing on the cluster
 import os
 os.environ["HDF5_USE_FILE_LOCKING"]="FALSE"
-
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import torch
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

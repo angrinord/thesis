@@ -1,3 +1,5 @@
+import sys
+sys.path.append('/home/angrimson/thesis')
 import experiment_util  # IMPORTANT!  DON'T REMOVE.
 import argparse
 import os
@@ -14,15 +16,16 @@ from keras.utils import io_utils
 from torch.utils.tensorboard import SummaryWriter
 
 # Constants and Variables Booker
-batch_size = 20  # How big should the generated batches be.  Best be a multiple of data cardinality (10 in MNIST's case)
-surrogate_data_filename = "surrogate"  # the file prefix for data created in pretraining
+batch_size = 10  # How big should the generated batches be.  Best be a multiple of data cardinality (10 in MNIST's case)
 sigma = 1e-10  # This is so entropy doesn't break
-directory = 'data'  # Directory that stores preprocessed MNIST and pretrained surrogate data
+directory = 'mystuff/data'  # Directory that stores preprocessed MNIST and pretrained surrogate data
 NUM_RANDOM_BATCHES = 1000  # Number of random batches BatchGenerator should create
 PATIENCE = 10  # Patience for early stopping callbacks.  Could technically be different between different models, but who cares?
 VAL_SEED = 0  # Seed for getting the same validation data every time
 EPOCHS = 10000  # Set very high so that early stopping always happens
 test_ratio = 0.1  # How much of dataset should be set aside for validation
+DEFAULT_BUDGET = 500
+DEFAULT_POOL_SIZE = 50
 
 
 def entropy_selector(batches, model):
@@ -38,7 +41,7 @@ def margin_selector(batches, model):
 
 def confidence_selector(batches, model):
     predictions = tf.reshape(model(tf.reshape(batches, (-1, batches.shape[-1]))), (batches.shape[0], batches.shape[1], -1))
-    return int(tf.argmin(tf.reduce_mean(tf.reduce_max(predictions, axis=1), axis=1), axis=0))
+    return int(tf.argmin(tf.reduce_mean(tf.reduce_max(predictions, axis=2), axis=1), axis=0))
 
 
 def random_selector(batches, model):
@@ -48,6 +51,9 @@ def random_selector(batches, model):
 def uniform_selector(batches, model):
     selectors = {0: entropy_selector, 1: margin_selector, 2: confidence_selector, 3: random_selector}
     return selectors[np.random.choice(4)](batches, model)
+
+
+regimes = {"random": random_selector, "entropy": entropy_selector, "margin": margin_selector, "confidence": confidence_selector, "uniform": uniform_selector}
 
 
 # This class handles the generation of random batches and the storage of data relevant to current and previously generated batches.
@@ -153,14 +159,9 @@ class BatchGenerator:
 
 
 # This function is for the generation of training data for the surrogate model.  The data is composed of... TODO: More comments
-def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100):
+def pretrain(intra_setpool, inter_setpool, data, idx, budget=DEFAULT_BUDGET, pool_size=DEFAULT_POOL_SIZE):
     torch.manual_seed(VAL_SEED)
     tf.random.set_seed(VAL_SEED)
-
-    regimes = [random_selector, entropy_selector, margin_selector, confidence_selector, uniform_selector]
-    surrogate_X = []
-    surrogate_y = []
-    surrogate_y_hat = []
 
     data_tensor = tf.concat([tf.convert_to_tensor(tensor[0].numpy()) for tensor in data.values()], axis=0)
     label_tensor = tf.keras.utils.to_categorical(tf.concat([tf.fill((tensor[0].shape[0],), label) for label, tensor in data.items()], axis=0))
@@ -198,13 +199,16 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
     primary_model.fit(pool_X, pool_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)])
     pool_weights = primary_model.get_weights()
 
-    for regime in regimes:
-        print(regime.__name__)
+    for regime_name, selector in regimes.items():
+        print(regime_name)
+        surrogate_X = []
+        surrogate_y = []
+        surrogate_y_hat = []
         primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
         data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, NUM_RANDOM_BATCHES, batch_size, (intra_setpool, inter_setpool))  # Generate 1000 random batches from remaining unlabelled pool
         data_generator.add(pool_X, pool_y)
         initial_loss = None
-        writer = SummaryWriter("runs/" f"{regime.__name__}" f"{idx}")
+        writer = SummaryWriter("runs/" f"{regime_name}" f"{idx}")
         labeled_X = pool_X
         labeled_y = pool_y
         test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
@@ -212,7 +216,7 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
         writer.add_scalar('accuracy', test_accuracy, data_generator.used)
         try:
             while True:
-                data_generator.n = regime(data_generator.X, primary_model)  # Sets the new batch
+                data_generator.n = selector(data_generator.X, primary_model)  # Sets the new batch
                 x, label = next(data_generator)  # get the batch
                 batch_metafeatures = data_generator.mfs[data_generator.n]  # Metafeature vector for the current batch
                 labeled_X = np.vstack((labeled_X, x))
@@ -252,7 +256,7 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=1000, pool_size=100
                 writer.add_scalar('loss_hat_change', test_loss_hat, data_generator.used)
                 writer.add_scalar('hat_accuracy', test_accuracy_hat, data_generator.used)
         except StopIteration:
-            with open(f'{directory}/{surrogate_data_filename}{idx}.pkl', 'wb') as f:
+            with open(f'{directory}/{regime_name}{idx}.pkl', 'wb') as f:
                 pickle.dump((surrogate_X, surrogate_y, surrogate_y_hat), f)
 
 
@@ -261,7 +265,6 @@ def main():
     parser.add_argument("-i", type=int)
     args = parser.parse_args()
     i = args.i
-
     with open('intra_setpool.pkl', 'rb') as input:
         intra_setpool = pickle.load(input)
     with open('inter_setpool.pkl', 'rb') as input:
@@ -271,10 +274,7 @@ def main():
         if file.endswith('mnistbylabel.pt'):
             with open(directory + '/' + file, 'rb') as f:
                 data = torch.load(f)
-    if not os.path.isfile(f'{directory}/{surrogate_data_filename}{i}.pkl'):
-        pretrain(intra_setpool, inter_setpool, data, i)
-        return 0
-    print(f'file \'{surrogate_data_filename}{i}.pkl\' already exists.  Skipping job...')
+    pretrain(intra_setpool, inter_setpool, data, i)
 
 
 if __name__ == '__main__':
