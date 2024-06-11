@@ -7,4 +7,4 @@
 #SBATCH --gres=gpu:1
 #SBATCH --exclude=gpu-110
 source activate thesisenv
-srun python ./mystuff/cluster_pretrain.py  -i "$1" --regime "$2"
+srun python ./mystuff/cluster_pretrain_corrected.py  -i "$1" --regime "$2"

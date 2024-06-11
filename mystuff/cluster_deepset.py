@@ -173,7 +173,7 @@ class BatchGenerator:
 regimes = {"confidence": confidence_selector, "random": random_selector, "entropy": entropy_selector, "margin": margin_selector, "uniform": uniform_selector}
 
 
-def pretrain(data, labels, metafeatures, set_encoder, encoder, aggregator, idx, budget=DEFAULT_BUDGET, pool_size=DEFAULT_POOL_SIZE):
+def pretrain(data, labels, metafeatures, set_encoder, aggregator, idx, budget=DEFAULT_BUDGET, pool_size=DEFAULT_POOL_SIZE):
     surrogate_X = []
     surrogate_y = []
     surrogate_y_hat = []
@@ -287,7 +287,7 @@ def main():
     encoder, aggregator = split_model(set_encoder)
     instance_mfs = np.squeeze(encoder.predict(np.expand_dims(data.data, 1)), 1)
 
-    pretrain(data.data, data.target, instance_mfs, set_encoder, encoder, aggregator, i)
+    pretrain(data.data, data.target, instance_mfs, set_encoder, aggregator, i)
 
 
 if __name__ == '__main__':

@@ -19,31 +19,29 @@ from sklearn.model_selection import train_test_split
 
 batch_count = 2000
 set_enc_range = (2, 16)
-set_enc_labelling = 'mean'
-set_encoder_file = f"deepset_{set_enc_labelling}_{set_enc_range[0]}_{set_enc_range[-1]}.pkl"
+set_enc_labelling = 'sum'
+set_encoder_file = f"deepset_test_{set_enc_labelling}_{set_enc_range[0]}_{set_enc_range[-1]}.pkl"
 VAL_SEED = 0  # Seed for getting the same validation data every time
 test_ratio = 0.1  # How much of dataset should be set aside for validation
 PATIENCE = 20
 embedding_dim = 16
 
 
-def get_deepset_model(data_dim):  # NOTE: Passing images is only necessary for testing.
+def get_deepset_model(data_dim):
     adam = Adam(lr=1e-3, epsilon=1e-3)
 
     # Encoder
     # TimeDistributed should leave the latent features uncorrelated across instances.
     input_img = Input(shape=(None, data_dim,))
     x = TimeDistributed(Dense(128, activation='tanh'))(input_img)
-    x = Dropout(0.2)(x)
     x = TimeDistributed(Dense(64, activation='tanh'))(x)
-    x = Dropout(0.2)(x)
     x = TimeDistributed(Dense(32, activation='tanh'))(x)
-    x = Dropout(0.2)(x)
     x = TimeDistributed(Dense(embedding_dim, activation='tanh'))(x)
 
     # Aggregator
-    x = backend.mean(x, axis=1)
+    x = backend.sum(x, axis=1)
     x = Dense(embedding_dim)(x)
+    x = Dense(1)(x)  # Throw this away
 
     model = Model(input_img, x)
     model.compile(optimizer=adam, loss="mae")
@@ -121,7 +119,7 @@ def main():
         set_generator = set_enc_sequence(X, encoder_y)
         val_generator = set_enc_sequence(val_X, encoder_val_y)
         reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, verbose=1, patience=PATIENCE, min_lr=1e-6)
-        set_encoder.fit(set_generator, epochs=300, shuffle=True, callbacks=[reduce_lr], validation_data=val_generator)
+        set_encoder.fit(set_generator, epochs=300, shuffle=True, callbacks=[reduce_lr, EarlyStopping(patience=PATIENCE*2)], validation_data=val_generator)
         deep_we = set_encoder.get_weights()
         # save weights
         with open(set_encoder_file, 'wb') as output:

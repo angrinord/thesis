@@ -1,79 +1,204 @@
 import os
+import re
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.integrate import simps
 from tensorboard.backend.event_processing import event_accumulator
 
-directory = 'runs'
+# DIRECTORY = 'runs'
+# DIRECTORY = 'xgboost'
+DIRECTORY = 'mystuff/collected_runs/fixed_deepset'
+bs_hypothesis = False
+primary = 5
 regimes_colors = {
-    'random_balanced': 'pink',
-    'entropy_balanced': 'springgreen',
-    'entropy': 'darkgreen',
     'random': 'red',
+    'entropy': 'darkgreen',
     'margin': 'yellow',
-    'confidence': 'cyan',
+    'confidence': 'darkturquoise',
     'uniform': 'magenta',
     'BADGE': 'blue',
     'surrogate': 'orange',
     'surrogate_loss': 'saddlebrown',
     'surrogate_hat': 'midnightblue',
     'surrogate_heuristics': 'slategray',
-    'surrogate_heuristics_hat': 'black'
+    'surrogate_heuristics_hat': 'black',
+    'surrogate_heuristics_loss': 'pink',
+    'random_balanced': 'pink',
+    'entropy_balanced': 'lightgreen',
+    'margin_balanced': 'yellow',
+    'confidence_balanced': 'steelblue',
+    'uniform_balanced': 'magenta'
+}
+
+size_styles = {
+    5: 'solid',
+    10: 'dashed',
+    15: 'dotted',
+    20: 'dashdot'
 }
 
 regimes = list(regimes_colors.keys())
-# regimes = regimes[:4]  # Compare balanced and unbalanced classes
-# regimes = regimes[:2] + regimes[-5:]  # Compare all surrogates
-# regimes = regimes[:2] + [regimes[-6]] + [regimes[-1]]  # Compare best surrogate to BADGE and heuristics
+
+
+def collect_acc(regime_dirs):
+    regime_acc = []
+    for regime_dir in regime_dirs:
+        event_file_path = os.path.join(regime_dir, os.listdir(regime_dir)[0])
+        event_file = event_accumulator.EventAccumulator(event_file_path, size_guidance={'tensors': 0})
+        event_file.Reload()
+        tags = event_file.Tags()['scalars']
+
+        data = pd.DataFrame(columns=['step'] + tags)
+
+        for tag in tags:
+            df = pd.DataFrame(event_file.Scalars(tag))
+            df = df.rename(columns={'value': tag}).drop(columns=['wall_time'])
+            data = data.merge(df, on='step', how='outer')
+        data.set_index('step', inplace=True)
+        new_index = np.arange(data.index.min(), data.index.max() + 1, 1)
+        regime_acc.append(data['accuracy_y'].reindex(new_index).interpolate())
+    return pd.concat(regime_acc, axis=1).agg(np.mean, 1)
+
+
+def toy_graphs(run_dir, save=False, font_size=30, batch_size=5, auc_ranges=[(0, 550), (0, 100)], acc_ranges=[(0.8, 1.0), (0.0, 1.0)]):
+    assert len(auc_ranges) == len(acc_ranges)
+    plt.rc('legend', fontsize=font_size)
+    plt.rc('legend', title_fontsize=font_size)
+    directory = run_dir + f"/{batch_size}"
+    graphs = {
+        "heur": regimes[:6],
+        "surr": regimes[6:12],
+        "best": [regimes[0]] + [regimes[2]] + [regimes[5]] + [regimes[7]] + [regimes[11]]
+             }
+    for graph in graphs:
+        subregimes = graphs[graph]
+        the_means = {}
+        for regime in subregimes:
+            pattern = re.compile(r'^({})_\d+$'.format(re.escape(regime)))  # Toy
+            regime_dirs = [os.path.join(directory, filename) for filename in os.listdir(directory) if pattern.match(filename)]
+            if regime_dirs:
+                the_means[regime] = collect_acc(regime_dirs)
+
+        for i in range(0, len(auc_ranges)):
+            fig, axes = plt.subplots(nrows=1, ncols=1)
+            fig.set_dpi(100)
+            fig.set_size_inches(19.20, 10.80, forward=True)
+            fig.supxlabel(f'Labeled Pool Size(bs={batch_size})')
+            fig.supylabel('Accuracy')
+            AUC_range = auc_ranges[i]
+            ACC_range = acc_ranges[i]
+            name = f"{graph}_{AUC_range[0]}:{AUC_range[1]}"
+            for regime in subregimes:
+                axes.plot(the_means[regime].index, the_means[regime].values, label=regime, color=regimes_colors[regime], linestyle='solid', linewidth=4)
+            axes.set_title('Mean Accuracy against Test(10 runs)')
+            axes.set_ylim(ACC_range)
+            axes.set_xlim(AUC_range)
+            [axes.hlines(y=i / 100, xmin=AUC_range[0], xmax=AUC_range[1], colors='black', alpha=0.3, linewidth=0.2, linestyle='dotted') for i in range(0, 100, 10)]
+            [axes.vlines(x=i, ymin=ACC_range[0], ymax=ACC_range[1], colors='black', alpha=0.3, linewidth=0.2, linestyle='dotted') for i in range(AUC_range[0], AUC_range[1], 50)]
+            axes.margins(0)
+            plt.legend(loc='lower right', title='Querying Strategy')
+            plt.tight_layout()
+            if save:
+                plt.savefig(f"{run_dir}/graphs/{name}.png", bbox_inches='tight')
+                plt.close()
+            else:
+                plt.show()
+                plt.close()
+
+
+def bs_graphs(run_dir, save=False, font_size=30, auc_ranges=[(0, 550), (0, 100)], acc_ranges=[(0.8, 1.0), (0.0, 1.0)]):
+    global size_styles
+    assert len(auc_ranges) == len(acc_ranges)
+    plt.rc('legend', fontsize=font_size)
+    plt.rc('legend', title_fontsize=font_size)
+    subregimes = regimes[:6] + [regimes[7]] + [regimes[11]]
+    for regime in subregimes:
+        the_means = {}
+        for batch_size in size_styles:
+            directory = run_dir + f"/{batch_size}"
+            pattern = re.compile(r'^({})_\d+$'.format(re.escape(regime)))  # Toy
+            regime_dirs = [os.path.join(directory, filename) for filename in os.listdir(directory) if pattern.match(filename)]
+            if regime_dirs:
+                the_means[batch_size] = collect_acc(regime_dirs)
+        for i in range(0, len(auc_ranges)):
+            fig, axes = plt.subplots(nrows=1, ncols=1)
+            fig.set_dpi(100)
+            fig.set_size_inches(19.20, 10.80, forward=True)
+            fig.supxlabel(f'Labeled Pool Size(qs={regime})')
+            fig.supylabel('Accuracy')
+            AUC_range = auc_ranges[i]
+            ACC_range = acc_ranges[i]
+            name = f"{regime}_{AUC_range[0]}:{AUC_range[1]}"
+            for batch_size in size_styles:
+                axes.plot(the_means[batch_size].index, the_means[batch_size].values, label=batch_size, color=regimes_colors[regime], linestyle=size_styles[batch_size], linewidth=4)
+            axes.set_title('Mean Accuracy against Test(10 runs)')
+            axes.set_ylim(ACC_range)
+            axes.set_xlim(AUC_range)
+            [axes.hlines(y=i / 100, xmin=AUC_range[0], xmax=AUC_range[1], colors='black', alpha=0.3, linewidth=0.2, linestyle='dotted') for i in range(0, 100, 10)]
+            [axes.vlines(x=i, ymin=ACC_range[0], ymax=ACC_range[1], colors='black', alpha=0.3, linewidth=0.2, linestyle='dotted') for i in range(AUC_range[0], AUC_range[1], 50)]
+            axes.margins(0)
+            plt.legend(loc='lower right', title="batch size")
+            plt.tight_layout()
+            if save:
+                plt.savefig(f"{run_dir}/graphs/{name}.png", bbox_inches='tight')
+                plt.close()
+            else:
+                plt.show()
+                plt.close()
+
+
+def main_graphs(run_dir, save=False, font_size=30, batch_size=5, auc_ranges=[(0, 500), (0, 100)], acc_ranges=[(0.7, 0.9), (0.0, 0.9)]):
+    assert len(auc_ranges) == len(acc_ranges)
+    plt.rc('legend', fontsize=font_size)
+    plt.rc('legend', title_fontsize=font_size)
+    graphs = {
+        "heur": regimes[:6],
+        "surr": regimes[6:12],
+        "balanced": [regimes[0]] + [regimes[3]] + [regimes[12]] + [regimes[15]],
+        "best": [regimes[12]] + [regimes[15]] + [regimes[6]] + [regimes[9]]
+             }
+    for graph in graphs:
+        subregimes = graphs[graph]
+        the_means = {}
+        for regime in subregimes:
+            pattern = re.compile(r'^({})\d+$'.format(re.escape(regime)))
+            regime_dirs = [os.path.join(run_dir, filename) for filename in os.listdir(run_dir) if pattern.match(filename)]
+            if regime_dirs:
+                the_means[regime] = collect_acc(regime_dirs)
+
+        for i in range(0, len(auc_ranges)):
+            fig, axes = plt.subplots(nrows=1, ncols=1)
+            fig.set_dpi(100)
+            fig.set_size_inches(19.20, 10.80, forward=True)
+            fig.supxlabel(f'Labeled Pool Size(bs={batch_size})')
+            fig.supylabel('Accuracy')
+            AUC_range = auc_ranges[i]
+            ACC_range = acc_ranges[i]
+            name = f"{graph}_{AUC_range[0]}:{AUC_range[1]}"
+            for regime in subregimes:
+                axes.plot(the_means[regime].index, the_means[regime].values, label=regime, color=regimes_colors[regime], linestyle='solid', linewidth=4)
+            axes.set_title('Mean Accuracy against Test(20 runs)')
+            axes.set_ylim(ACC_range)
+            axes.set_xlim(AUC_range)
+            [axes.hlines(y=i / 100, xmin=AUC_range[0], xmax=AUC_range[1], colors='black', alpha=0.3, linewidth=0.2, linestyle='dotted') for i in range(0, 100, 10)]
+            [axes.vlines(x=i, ymin=ACC_range[0], ymax=ACC_range[1], colors='black', alpha=0.3, linewidth=0.2, linestyle='dotted') for i in range(AUC_range[0], AUC_range[1], 50)]
+            axes.margins(0)
+            plt.legend(loc='lower right', title='Querying Strategy')
+            plt.tight_layout()
+            if save:
+                plt.savefig(f"{run_dir}/graphs/{name}.png", bbox_inches='tight')
+                plt.close()
+            else:
+                plt.show()
+                plt.close()
 
 
 def main():
-    fig, axes = plt.subplots(nrows=3, ncols=1)
-    i = 0
-    for regime in regimes:
-        regime_dirs = [os.path.join(directory, filename) for filename in os.listdir(directory) if filename.startswith(regime)]
-        regime_acc = []
-        regime_auc = []
-        regime_loss = []
-        regime_mean = {}
-        regime_mean_auc = {}
-        regime_mean_loss = {}
-        for regime_dir in regime_dirs:
-            event_file_path = os.path.join(regime_dir, os.listdir(regime_dir)[0])
-            event_file = event_accumulator.EventAccumulator(event_file_path, size_guidance={'tensors': 0})
-            event_file.Reload()
-            tags = event_file.Tags()['scalars']
-
-            # Initialize an empty DataFrame
-            data = pd.DataFrame(columns=['step'] + tags)
-
-            # Extract data for each tag and populate the DataFrame
-            for tag in tags:
-                df = pd.DataFrame(event_file.Scalars(tag))
-                df = df.rename(columns={'value': tag}).drop(columns=['wall_time'])
-                data = data.merge(df, on='step', how='outer')
-            data.set_index('step', inplace=True)
-            new_index = np.arange(data.index.min(), data.index.max() + 1, 1)
-            regime_auc.append(data['auc_y'].reindex(new_index).interpolate())
-            regime_acc.append(data['accuracy_y'].reindex(new_index).interpolate())
-            regime_loss.append(data['loss_change_y'].reindex(new_index).interpolate())
-        regime_mean[regime] = pd.concat(regime_acc, axis=1).agg(np.mean, 1)
-        regime_mean_auc[regime] = pd.concat(regime_auc, axis=1).agg(np.mean, 1)
-        regime_mean_loss[regime] = pd.concat(regime_loss, axis=1).agg(np.mean, 1)
-        axes[0].plot(regime_mean[regime].index, regime_mean[regime].values, label=regime, color=regimes_colors[regime])
-        axes[1].plot(regime_mean_auc[regime].index, regime_mean_auc[regime].values, label=regime, color=regimes_colors[regime])
-        axes[2].plot(regime_mean_loss[regime].index, regime_mean_loss[regime].values, label=regime, color=regimes_colors[regime])
-        i += 1
-    fig.supxlabel('Labeled Pool Size')
-    axes[0].set_ylabel('Accuracy')
-    axes[1].set_ylabel('AUC')
-    axes[2].set_ylabel('Loss')
-    axes[0].set_title('Primary Model Accuracy')
-    axes[1].set_title('Primary Model AUC')
-    axes[2].set_title('Primary Model Loss')
-    axes[0].legend(title='Acquisition Functions')
-    plt.margins(0)
-    plt.show()
+    main_graphs('runs', True)
+    # bs_graphs(DIRECTORY, True)
+    # toy_graphs(DIRECTORY, True)
 
 
 if __name__ == '__main__':

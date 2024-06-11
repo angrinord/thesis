@@ -1,0 +1,13 @@
+
+*.pkl
+*.svg
+*.png
+/xgboost/
+/runs/
+/DeepSets/
+/cd-diagram/
+/mystuff/data/
+/mystuff/collected_runs/
+/mystuff/old_stuff/
+/MetaD2A/
+/mystuff/datasets/

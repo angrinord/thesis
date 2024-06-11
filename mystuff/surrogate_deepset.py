@@ -1,7 +1,9 @@
 import sys
 
 from scipy.spatial import distance_matrix
+from scipy.stats import stats
 from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances
 
 sys.path.append('/home/angrimson/thesis')
 import experiment_util  # IMPORTANT!  DON'T REMOVE.
@@ -94,7 +96,32 @@ def generate_batches(data, labels, count, size_range, metafeatures=None, aggrega
         return np.array(batches), np.array(batches_y), np.array(batches_mf).reshape(count, metafeatures.shape[-1]), np.array(batches_indices)
 
 
-def badge_selector(data_generator, primary_model):
+def kmeanspp(gradients, K, idx):
+    ind = int(tf.argmax(tf.linalg.norm(gradients, axis=1)))
+    mu = [gradients[ind]]
+    indsAll = [ind]
+    centInds = [0.] * len(gradients)
+    cent = 0
+    while len(mu) < K:
+        if len(mu) == 1:
+            D2 = pairwise_distances(gradients, mu).ravel().astype(float)
+        else:
+            newD = pairwise_distances(gradients, [mu[-1]]).ravel().astype(float)
+            for i in range(len(gradients)):
+                if D2[i] > newD[i]:
+                    centInds[i] = cent
+                    D2[i] = newD[i]
+        D2 = D2.ravel().astype(float)
+        Ddist = (D2 ** 2) / sum(D2 ** 2)
+        customDist = stats.rv_discrete(name='custm', values=(np.arange(len(D2)), Ddist), seed=idx)
+        ind = customDist.rvs(size=1)[0]
+        mu.append(gradients[ind])
+        indsAll.append(ind)
+        cent += 1
+    return indsAll
+
+
+def badge_selector(data_generator, primary_model, idx):
     with tf.GradientTape(persistent=True) as tape:
         data = tf.convert_to_tensor(data_generator.data)
         tape.watch(data)
@@ -105,9 +132,7 @@ def badge_selector(data_generator, primary_model):
         last_layer_params = primary_model.layers[-1].trainable_variables
         gradients = [tape.gradient(x, last_layer_params) for x in loss]
         gradients = [tf.norm(tf.concat([gradient[0], tf.expand_dims(gradient[1], axis=0)], axis=0), axis=1) for gradient in gradients]
-        kmeans = KMeans(n_clusters=data_generator.X.shape[1], init='k-means++', random_state=VAL_SEED)
-        mat = distance_matrix(kmeans.fit(gradients).cluster_centers_, np.asmatrix(gradients))
-        closest = [i for i in np.argmin(mat, axis=1)]
+        closest = kmeanspp(gradients, data_generator.size, idx)
         data_generator.X[0] = data_generator.data[closest]
         data_generator.y[0] = data_generator.labels[closest]
         data_generator.mfs[0] = data_generator.aggregator(data_generator.metafeatures[closest].reshape(1, data_generator.X.shape[1], data_generator.metafeatures.shape[-1]))
@@ -296,6 +321,47 @@ def evaluate_surrogate(data, labels, metafeatures, encoder, aggregator, idx, sur
     primary_model.fit(pool_X, pool_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)])
     pool_weights = primary_model.get_weights()
 
+    # BADGE part
+    def badge():
+        print("BADGE")
+        primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
+        data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, batch_count, batch_size, unlabeled_mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
+        data_generator.add(pool_X, pool_y, pool_mfs)
+        writer = SummaryWriter("runs/evaluate_toy/BADGE" f"{idx}")
+        labeled_X = pool_X
+        labeled_y = pool_y
+        test_loss, test_accuracy = primary_model.evaluate(test_X, test_y)
+        values = [test_accuracy]
+        indices = [data_generator.used]
+        auc = simps(values, x=indices)
+        aucs = [auc]
+
+        writer.add_scalar('auc', auc, data_generator.used)
+        writer.add_scalar('loss_change', test_loss, data_generator.used)
+        writer.add_scalar('accuracy', test_accuracy, data_generator.used)
+        try:  # Iterators are supposed to throw StopIteration exception when they reach the end
+            while True:  # This goes until budget is exhausted
+                data_generator.n = badge_selector(data_generator, primary_model, idx)
+                x, label = next(data_generator)  # get the batch
+                labeled_X = np.vstack((labeled_X, x))
+                labeled_y = np.concatenate((labeled_y, label))
+
+                primary_model.fit(labeled_X, labeled_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)], verbose=0)
+                test_loss, test_accuracy = primary_model.evaluate(test_X, test_y)
+
+                data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instance
+
+                values.append(test_accuracy)
+                indices.append(data_generator.used)
+                auc = simps(values, x=indices)
+                aucs.append(auc)
+                writer.add_scalar('auc', auc, data_generator.used)
+                writer.add_scalar('loss_change', test_loss, data_generator.used)
+                writer.add_scalar('accuracy', test_accuracy, data_generator.used)
+        except StopIteration:
+            pass
+    badge()
+
     # Surrogate(heuristics only)
     def heuristics_part():
         print("surrogate(heuristics only)")
@@ -459,47 +525,6 @@ def evaluate_surrogate(data, labels, metafeatures, encoder, aggregator, idx, sur
         except StopIteration:
             pass
     surrogate_part()
-
-    # BADGE part
-    def badge():
-        print("BADGE")
-        primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
-        data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, batch_count, batch_size, unlabeled_mfs, aggregator)  # Generate 1000 random batches from remaining unlabelled pool
-        data_generator.add(pool_X, pool_y, pool_mfs)
-        writer = SummaryWriter("runs/evaluate_toy/BADGE" f"{idx}")
-        labeled_X = pool_X
-        labeled_y = pool_y
-        test_loss, test_accuracy = primary_model.evaluate(test_X, test_y)
-        values = [test_accuracy]
-        indices = [data_generator.used]
-        auc = simps(values, x=indices)
-        aucs = [auc]
-
-        writer.add_scalar('auc', auc, data_generator.used)
-        writer.add_scalar('loss_change', test_loss, data_generator.used)
-        writer.add_scalar('accuracy', test_accuracy, data_generator.used)
-        try:  # Iterators are supposed to throw StopIteration exception when they reach the end
-            while True:  # This goes until budget is exhausted
-                data_generator.n = badge_selector(data_generator, primary_model)
-                x, label = next(data_generator)  # get the batch
-                labeled_X = np.vstack((labeled_X, x))
-                labeled_y = np.concatenate((labeled_y, label))
-
-                primary_model.fit(labeled_X, labeled_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)], verbose=0)
-                test_loss, test_accuracy = primary_model.evaluate(test_X, test_y)
-
-                data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instance
-
-                values.append(test_accuracy)
-                indices.append(data_generator.used)
-                auc = simps(values, x=indices)
-                aucs.append(auc)
-                writer.add_scalar('auc', auc, data_generator.used)
-                writer.add_scalar('loss_change', test_loss, data_generator.used)
-                writer.add_scalar('accuracy', test_accuracy, data_generator.used)
-        except StopIteration:
-            pass
-    badge()
 
     # Raw Heuristics
     for regime_name, selector in regimes.items():
