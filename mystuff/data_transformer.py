@@ -2,7 +2,7 @@ import os
 import pickle
 import tensorflow as tf
 
-directory = 'mystuff/data'
+directory = 'mystuff/data/fixed_main'
 output_file = 'dataset.tfrecords'
 
 

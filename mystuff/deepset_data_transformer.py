@@ -2,8 +2,8 @@ import os
 import pickle
 import tensorflow as tf
 
-directory = 'mystuff/data/deepset_toy'
-output_file = 'deepset_dataset.tfrecords'
+directory = 'mystuff/data/fixed_deepset/clipped'
+output_file = 'deepset_dataset_clipped.tfrecords'
 
 
 def main():
@@ -16,7 +16,7 @@ def main():
                     with open(file_path, 'rb') as in_file:
                         data, loss, hat = pickle.load(in_file)
                         for j in range(len(data)):
-                            data_bytes = tf.io.serialize_tensor(tf.convert_to_tensor(data[j].astype('float32')))
+                            data_bytes = tf.io.serialize_tensor(data[j])
                             loss_bytes = tf.io.serialize_tensor(tf.convert_to_tensor(loss[j]))
                             hat_bytes = tf.io.serialize_tensor(tf.convert_to_tensor(hat[j]))
 

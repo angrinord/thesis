@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 # Constants and Variables Booker
 batch_size = 10  # How big should the generated batches be.  Best be a multiple of data cardinality (10 in MNIST's case)
 sigma = 1e-10  # This is so entropy doesn't break
-directory = 'mystuff/data'  # Directory that stores preprocessed MNIST and pretrained surrogate data
+directory = 'mystuff/data/fixed_main'  # Directory that stores preprocessed MNIST and pretrained surrogate data
 NUM_RANDOM_BATCHES = 1000  # Number of random batches BatchGenerator should create
 PATIENCE = 10  # Patience for early stopping callbacks.  Could technically be different between different models, but who cares?
 VAL_SEED = 0  # Seed for getting the same validation data every time
@@ -159,7 +159,7 @@ class BatchGenerator:
 
 
 # This function is for the generation of training data for the surrogate model.  The data is composed of... TODO: More comments
-def pretrain(intra_setpool, inter_setpool, data, idx, budget=DEFAULT_BUDGET, pool_size=DEFAULT_POOL_SIZE):
+def pretrain(intra_setpool, inter_setpool, data, idx, regime_name, budget=DEFAULT_BUDGET, pool_size=DEFAULT_POOL_SIZE):
     torch.manual_seed(VAL_SEED)
     tf.random.set_seed(VAL_SEED)
 
@@ -172,8 +172,8 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=DEFAULT_BUDGET, poo
     test_indices = indices[:num_test_samples]
     train_X = tf.gather(data_tensor, train_indices)
     train_y = tf.gather(label_tensor, train_indices)
-    test_X = tf.gather(data_tensor, test_indices)
-    test_y = tf.gather(label_tensor, test_indices)
+    # test_X = tf.gather(data_tensor, test_indices)
+    # test_y = tf.gather(label_tensor, test_indices)
 
     indices = tf.random.shuffle(tf.range(train_X.shape[0]))
     train_indices = indices[num_test_samples:]
@@ -192,8 +192,8 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=DEFAULT_BUDGET, poo
     pool_X, unlabeled_X = X[:pool_size], X[pool_size:]
     pool_y, unlabeled_y = y[:pool_size], y[pool_size:]
 
-    file_path = f"{directory}/initial_models{pool_size}/initial{idx}.pkl"
-    lock_path = f"{directory}/initial_models{pool_size}/lock{idx}.lock"
+    file_path = f"{directory}/initial_models/initial{idx}.pkl"
+    lock_path = f"{directory}/initial_models/lock{idx}.lock"
     while os.path.exists(lock_path):
         time.sleep(1)
 
@@ -214,73 +214,71 @@ def pretrain(intra_setpool, inter_setpool, data, idx, budget=DEFAULT_BUDGET, poo
             pool_weights = pickle.load(model_file)
             primary_model.set_weights(pool_weights)
 
-    for regime_name, selector in regimes.items():
-        print(regime_name)
-        surrogate_X = []
-        surrogate_y = []
-        surrogate_y_hat = []
-        primary_model.set_weights(pool_weights)  # Every model starts trained on same initial training pool
-        data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, NUM_RANDOM_BATCHES, batch_size, (intra_setpool, inter_setpool))  # Generate 1000 random batches from remaining unlabelled pool
-        data_generator.add(pool_X, pool_y)
-        initial_loss = None
-        writer = SummaryWriter("runs/" f"{regime_name}" f"{idx}")
-        labeled_X = pool_X
-        labeled_y = pool_y
-        test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
-        writer.add_scalar('loss_change', test_loss, data_generator.used)
-        writer.add_scalar('accuracy', test_accuracy, data_generator.used)
+    print(f"{regime_name}{idx}")
+    surrogate_X = []
+    surrogate_y = []
+    surrogate_y_hat = []
+    data_generator = BatchGenerator(unlabeled_X, unlabeled_y, budget, NUM_RANDOM_BATCHES, batch_size, (intra_setpool, inter_setpool))  # Generate 1000 random batches from remaining unlabelled pool
+    data_generator.add(pool_X, pool_y)
+    initial_loss = None
+    # writer = SummaryWriter("runs/" f"{regime_name}" f"{idx}")
+    labeled_X = pool_X
+    labeled_y = pool_y
+    # test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
+    # writer.add_scalar('loss_change', test_loss, data_generator.used)
+    # writer.add_scalar('accuracy', test_accuracy, data_generator.used)
+    try:
+        while True:
+            pool_metafeatures = inter_setpool(intra_setpool(torch.tensor(tf.stack(data_generator.get_selected()).numpy())).squeeze(1).unsqueeze(0)).squeeze().detach()
+            data_generator.n = regimes[regime_name](data_generator.X, primary_model)  # Sets the new batch
+            x, label = next(data_generator)  # get the batch
+            batch_metafeatures = data_generator.mfs[data_generator.n]  # Metafeature vector for the current batch
+            labeled_X = np.vstack((labeled_X, x))
+            labeled_y = np.concatenate((labeled_y, label))
 
-        try:
-            while True:
-                data_generator.n = selector(data_generator.X, primary_model)  # Sets the new batch
-                x, label = next(data_generator)  # get the batch
-                batch_metafeatures = data_generator.mfs[data_generator.n]  # Metafeature vector for the current batch
-                labeled_X = np.vstack((labeled_X, x))
-                labeled_y = np.concatenate((labeled_y, label))
+            one_step_model.set_weights(primary_model.get_weights())
+            one_step_model.train_on_batch(x, label)  # single gradient update on batch
+            val_loss_hat, accuracy_hat = one_step_model.evaluate(val_X, val_y, verbose=0)
+            # test_loss_hat, test_accuracy_hat = one_step_model.evaluate(test_X, test_y, verbose=0)
 
-                one_step_model.set_weights(primary_model.get_weights())
-                one_step_model.train_on_batch(x, label)  # single gradient update on batch
-                val_loss_hat, accuracy_hat = one_step_model.evaluate(val_X, val_y, verbose=0)
-                test_loss_hat, test_accuracy_hat = one_step_model.evaluate(test_X, test_y, verbose=0)
+            predictions = primary_model.predict(x, verbose=0)
+            primary_model.fit(labeled_X, labeled_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)], verbose=0)
+            val_loss, accuracy = primary_model.evaluate(val_X, val_y)
+            # test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
 
-                # K.clear_session()
-                primary_model.fit(labeled_X, labeled_y, epochs=EPOCHS, validation_data=(val_X, val_y), callbacks=[EarlyStopping(patience=PATIENCE)], verbose=0)
-                val_loss, accuracy = primary_model.evaluate(val_X, val_y)
-                test_loss, test_accuracy = primary_model.evaluate(test_X, test_y, verbose=0)
+            data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
 
-                data_generator.regenerate()  # Regenerate 1000 batches, excluding already used instances
+            entropy = np.array([np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=1))])
+            sorted_predictions = np.sort(predictions, axis=1)
+            margin = np.array([np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2])])
+            confidence = np.array([np.mean(np.max(predictions, axis=1))])
+            used = np.array([data_generator.used])
+            histogram = np.mean([np.histogram(predictions[:, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[1])], axis=0)
+            surrogate_in = tf.concat((batch_metafeatures, pool_metafeatures, entropy, margin, confidence, used, histogram), axis=0)
 
-                pool_metafeatures = inter_setpool(intra_setpool(torch.tensor(tf.stack(data_generator.get_selected()).numpy())).squeeze(1).unsqueeze(0)).squeeze().detach()
-                predictions = primary_model.predict(x, verbose=0)
-                entropy = np.array([np.mean(-np.sum(predictions * np.log2(np.maximum(predictions, sigma)), axis=1))])
-                sorted_predictions = np.sort(predictions, axis=1)
-                margin = np.array([np.mean(sorted_predictions[:, -1] - sorted_predictions[:, -2])])
-                confidence = np.array([np.mean(np.max(predictions, axis=1))])
-                used = np.array([data_generator.used])
-                histogram = np.mean([np.histogram(predictions[:, i], bins=10, range=(0, 1), density=True)[0] for i in range(predictions.shape[1])], axis=0)
-                surrogate_in = tf.concat((batch_metafeatures, pool_metafeatures, entropy, margin, confidence, used, histogram), axis=0)
-
-                if initial_loss is None:
-                    initial_loss = val_loss
-                else:
-                    surrogate_X.append(surrogate_in)
-                    surrogate_y.append(initial_loss - val_loss)
-                    surrogate_y_hat.append(initial_loss - val_loss_hat)
-                    initial_loss = val_loss
-                writer.add_scalar('loss_change', test_loss, data_generator.used)
-                writer.add_scalar('accuracy', test_accuracy, data_generator.used)
-                writer.add_scalar('loss_hat_change', test_loss_hat, data_generator.used)
-                writer.add_scalar('hat_accuracy', test_accuracy_hat, data_generator.used)
-        except StopIteration:
-            with open(f'{directory}/{regime_name}{idx}.pkl', 'wb') as f:
-                pickle.dump((surrogate_X, surrogate_y, surrogate_y_hat), f)
+            if initial_loss is None:
+                initial_loss = val_loss
+            else:
+                surrogate_X.append(surrogate_in)
+                surrogate_y.append(initial_loss - val_loss)
+                surrogate_y_hat.append(initial_loss - val_loss_hat)
+                initial_loss = val_loss
+            # writer.add_scalar('loss_change', test_loss, data_generator.used)
+            # writer.add_scalar('accuracy', test_accuracy, data_generator.used)
+            # writer.add_scalar('loss_hat_change', test_loss_hat, data_generator.used)
+            # writer.add_scalar('hat_accuracy', test_accuracy_hat, data_generator.used)
+    except StopIteration:
+        with open(f'{directory}/{regime_name}{idx}.pkl', 'wb') as f:
+            pickle.dump((surrogate_X, surrogate_y, surrogate_y_hat), f)
 
 
 def main():
     parser = argparse.ArgumentParser("cluster_pretrain")
     parser.add_argument("-i", type=int)
+    parser.add_argument("--regime")
     args = parser.parse_args()
     i = args.i
+    regime = args.regime
     with open('intra_setpool.pkl', 'rb') as input:
         intra_setpool = pickle.load(input)
     with open('inter_setpool.pkl', 'rb') as input:
@@ -290,7 +288,7 @@ def main():
         if file.endswith('mnistbylabel.pt'):
             with open(directory + '/' + file, 'rb') as f:
                 data = torch.load(f)
-    pretrain(intra_setpool, inter_setpool, data, i)
+    pretrain(intra_setpool, inter_setpool, data, i, regime)
 
 
 if __name__ == '__main__':
