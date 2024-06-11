@@ -1,0 +1,1 @@
+To anyone viewing this, this repository is a mess of deprecated and haphazard scripts.  Please don't take the slapdash nature of this repository as a measure of my ability to neatly code.  This is for personal use only.
